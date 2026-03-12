@@ -14,7 +14,7 @@ app = Flask(__name__)
 # ==========================================
 def convertir_a_minutos(tiempo_str):
     try:
-        partes = tiempo_str.strip().split(':')
+        partes = str(tiempo_str).strip().split(':')
         if len(partes) == 3:
             h, m, s = int(partes[0]), int(partes[1]), int(partes[2])
             return (h * 60) + m + (s / 60.0)
@@ -159,19 +159,31 @@ def analizar_datos():
 
         todas_las_muestras = {}
         
-        # 1. Leer y estructurar los datos
+        # 1. Leer y estructurar los datos (VERSIÓN BLINDADA)
         for fila in datos_n8n:
-            texto_tiempos = fila.get("SLA_TRAZA", "")
-            col_b = fila.get("ASIGNADO_A", "")
-            col_c = fila.get("CASUISTICA", "")
-            col_d = fila.get("OPS", "")
+            texto_tiempos = col_b = col_c = col_d = ""
             
-            if not texto_tiempos or "SLA_TRAZA" in str(texto_tiempos):
+            # Buscamos las columnas por palabras clave, sin importar comillas o prefijos
+            for key, val in fila.items():
+                k_upper = str(key).upper()
+                if "SLA_TRAZA" in k_upper: texto_tiempos = val
+                elif "ASIGNADO" in k_upper: col_b = val
+                elif "CASUISTICA" in k_upper: col_c = val
+                elif "OPS" in k_upper: col_d = val
+            
+            # Si no hay tiempos o es la fila de encabezado, saltamos
+            if not texto_tiempos or "SLA_TRAZA" in str(texto_tiempos).upper():
                 continue
 
+            # Limpiar posibles comillas sueltas en los nombres
+            col_b = str(col_b).replace("'", "").replace('"', "").strip()
+            col_c = str(col_c).replace("'", "").replace('"', "").strip()
+            col_d = str(col_d).replace("'", "").replace('"', "").strip()
+            
             nombre_muestra = f"{col_b} | {col_c} | {col_d}"
             
             try:
+                # Convertimos el string a una lista de Python
                 lista_tiempos_str = ast.literal_eval(str(texto_tiempos))
                 tiempos_minutos = [convertir_a_minutos(t) for t in lista_tiempos_str]
                 
