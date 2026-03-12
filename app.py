@@ -5,6 +5,7 @@ import warnings
 import ast
 import os
 
+# Desactivar advertencias matemáticas para mantener la consola limpia
 warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
@@ -12,19 +13,23 @@ app = Flask(__name__)
 # ==========================================
 # 1. FUNCIONES MATEMÁTICAS Y DE LIMPIEZA
 # ==========================================
+
 def convertir_a_minutos(tiempo_str):
     try:
+        if not tiempo_str: return 0.0
         partes = str(tiempo_str).strip().replace("'", "").replace('"', '').split(':')
-        if len(partes) == 3:
+        if len(partes) == 3: # HH:MM:SS
             return (int(partes[0]) * 60) + int(partes[1]) + (int(partes[2]) / 60.0)
-        elif len(partes) == 2:
+        elif len(partes) == 2: # MM:SS
             return int(partes[0]) + (int(partes[1]) / 60.0)
-        return 0.0
-    except Exception: return 0.0
+        return float(tiempo_str)
+    except: return 0.0
 
 def pasa_aleatoriedad(datos, alpha=0.05):
     n = len(datos)
     if n < 4: return False
+    
+    # Prueba de Rachas (Wald-Wolfowitz)
     mediana = np.median(datos)
     signos = [1 if x > mediana else (0 if x < mediana else None) for x in datos]
     signos = [s for s in signos if s is not None]
@@ -40,12 +45,14 @@ def pasa_aleatoriedad(datos, alpha=0.05):
     z_mediana = (rachas - mean_runs) / std_runs if std_runs > 0 else 0
     p_mediana = 2 * (1 - stats.norm.cdf(abs(z_mediana)))
     
+    # Prueba de Puntos de Giro (Tendencias)
     turnings = sum(1 for i in range(1, n - 1) if (datos[i-1] < datos[i] > datos[i+1]) or (datos[i-1] > datos[i] < datos[i+1]))
     mean_turn = (2 * n - 1) / 3
     var_turn = (16 * n - 29) / 90
     std_turn = np.sqrt(var_turn) if var_turn > 0 else 0
     z_turn = (turnings - mean_turn) / std_turn if std_turn > 0 else 0
     p_turn = 2 * (1 - stats.norm.cdf(abs(z_turn)))
+    
     return (p_mediana > alpha and p_turn > alpha)
 
 def limpiar_outliers_iqr(datos):
@@ -64,6 +71,7 @@ def agrupar_muestras_homogeneas(muestras_validas, alpha=0.05):
             if p_val > alpha:
                 similares[n1].add(n2)
                 similares[n2].add(n1)
+    
     visitados, grupos = set(), []
     for nombre in nombres:
         if nombre not in visitados:
@@ -74,6 +82,7 @@ def agrupar_muestras_homogeneas(muestras_validas, alpha=0.05):
                     visitados.add(act); g_actual.add(act)
                     cola.extend(list(similares[act] - visitados))
             grupos.append(g_actual)
+    
     pooled = {}
     for i, grupo in enumerate(grupos):
         n_grupo = " + ".join(sorted(list(grupo)))
@@ -94,48 +103,66 @@ def ajustar_grupo(datos, nombre_grupo):
             ks_stat, _ = stats.kstest(datos, dist.name, args=params)
             resultados.append({"nombre": nombre, "dist_obj": dist, "params": params, "ks": ks_stat})
         except: continue
+    
     resultados.sort(key=lambda x: x["ks"])
     mejor = resultados[0]
+    
+    # Top 3 para visibilidad
+    top_3 = [{"nombre": r["nombre"], "score": i+1} for i, r in enumerate(resultados[:3])]
+    
     return {
         "grupo_nombre": nombre_grupo,
-        "cantidad_datos": N,
+        "cantidad_datos": int(N),
         "distribucion_ganadora": mejor['nombre'],
-        "rango_60_minutos": [round(mejor['dist_obj'].ppf(0.20, *mejor['params']), 2), 
-                             round(mejor['dist_obj'].ppf(0.80, *mejor['params']), 2)]
+        "rango_60_minutos": [round(float(mejor['dist_obj'].ppf(0.20, *mejor['params'])), 2), 
+                             round(float(mejor['dist_obj'].ppf(0.80, *mejor['params'])), 2)],
+        "top_3_distribuciones": top_3
     }
 
 # ==========================================
-# 2. ENDPOINT PRINCIPAL
+# 2. ENDPOINT PRINCIPAL (API)
 # ==========================================
+
 @app.route('/analizar', methods=['POST'])
 def analizar():
     try:
         raw_data = request.json
         if not raw_data: return jsonify({"error": "No data"}), 400
+        
+        # Normalizar datos de n8n
         items = raw_data["data"] if isinstance(raw_data, dict) and "data" in raw_data else (raw_data if isinstance(raw_data, list) else [raw_data])
 
         dict_muestras = {}
         for fila in items:
-            t_raw = next((v for k, v in fila.items() if any(x in k.upper() for x in ["TRAZA", "SLA"])), "")
-            col_b = fila.get("ASIGNADO A OMT", "N/A")
-            col_c = fila.get("CASUISTICA", "N/A")
-            col_d = fila.get("OPS", "N/A")
+            # --- BUSCADOR INTELIGENTE DE COLUMNAS ---
+            t_raw = next((v for k, v in fila.items() if any(x in str(k).upper() for x in ["TRAZA", "SLA", "TIEMPO"])), "")
+            col_b = next((v for k, v in fila.items() if "ASIGNADO" in str(k).upper()), "Sin Asignado")
+            col_c = next((v for k, v in fila.items() if "CASUISTICA" in str(k).upper() or "CASO" in str(k).upper()), "Sin Caso")
+            col_d = next((v for k, v in fila.items() if "OPS" in str(k).upper() or "OPERACION" in str(k).upper()), "N/A")
+            
             key = f"{col_b} | {col_c} | {col_d}"
             
             try:
                 if isinstance(t_raw, list): lista = t_raw
                 elif isinstance(t_raw, str) and t_raw.strip().startswith('['): lista = ast.literal_eval(t_raw)
                 else: lista = [t_raw]
+                
                 minutos = [convertir_a_minutos(t) for t in lista if t]
                 if minutos:
-                    dict_muestras[key] = np.concatenate([dict_muestras.get(key, np.array([])), minutos])
+                    if key in dict_muestras:
+                        dict_muestras[key] = np.concatenate([dict_muestras[key], minutos])
+                    else:
+                        dict_muestras[key] = np.array(minutos)
             except: pass
 
         validas, rechazadas = {}, []
         for nombre, datos in dict_muestras.items():
+            # Prueba 1: Cantidad
             if len(datos) < 4:
                 rechazadas.append({"nombre": nombre, "motivo": f"Datos insuficientes ({len(datos)})"})
                 continue
+            
+            # Prueba 2: Aleatoriedad
             if pasa_aleatoriedad(datos):
                 validas[nombre] = datos
             else:
@@ -143,11 +170,13 @@ def analizar():
                 if len(limpios) >= 4 and pasa_aleatoriedad(limpios):
                     validas[nombre] = limpios
                 else:
-                    rechazadas.append({"nombre": nombre, "motivo": "Falla prueba de aleatoriedad (Datos sesgados)"})
+                    rechazadas.append({"nombre": nombre, "motivo": "Falla prueba de aleatoriedad (Datos con sesgos/tendencias)"})
 
         res_estadisticos = []
         if validas:
+            # Prueba 3: Homogeneidad (Pooling)
             pooled = agrupar_muestras_homogeneas(validas) if len(validas) > 1 else {list(validas.keys())[0]: list(validas.values())[0]}
+            # Prueba 4: Bondad de Ajuste
             for n, d in pooled.items():
                 res_estadisticos.append(ajustar_grupo(d, n))
 
@@ -156,6 +185,7 @@ def analizar():
             "resultados_estadisticos": res_estadisticos,
             "muestras_rechazadas": rechazadas
         }), 200
+
     except Exception as e:
         return jsonify({"status": "error", "mensaje": str(e)}), 500
 
@@ -163,4 +193,5 @@ def analizar():
 def health(): return jsonify({"status": "online"}), 200
 
 if __name__ == '__main__':
+    # Render usa la variable de entorno PORT
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
