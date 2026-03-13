@@ -4,6 +4,7 @@ import scipy.stats as stats
 import warnings
 import ast
 import os
+import json # Importante para reemplazar ast
 
 # Desactivar advertencias matemáticas para mantener la consola limpia
 warnings.filterwarnings("ignore")
@@ -12,6 +13,7 @@ app = Flask(__name__)
 
 # ==========================================
 # 1. FUNCIONES MATEMÁTICAS Y DE LIMPIEZA
+# (Mantenidas igual, ya están bien diseñadas)
 # ==========================================
 
 def convertir_a_minutos(tiempo_str):
@@ -107,7 +109,6 @@ def ajustar_grupo(datos, nombre_grupo):
     resultados.sort(key=lambda x: x["ks"])
     mejor = resultados[0]
     
-    # Top 3 para visibilidad
     top_3 = [{"nombre": r["nombre"], "score": i+1} for i, r in enumerate(resultados[:3])]
     
     return {
@@ -120,7 +121,7 @@ def ajustar_grupo(datos, nombre_grupo):
     }
 
 # ==========================================
-# 2. ENDPOINT PRINCIPAL (API)
+# 2. ENDPOINT PRINCIPAL (API) OPTIMIZADO
 # ==========================================
 
 @app.route('/analizar', methods=['POST'])
@@ -129,23 +130,34 @@ def analizar():
         raw_data = request.json
         if not raw_data: return jsonify({"error": "No data"}), 400
         
-        # Normalizar datos de n8n
-        items = raw_data["data"] if isinstance(raw_data, dict) and "data" in raw_data else (raw_data if isinstance(raw_data, list) else [raw_data])
+        items = raw_data.get("data", raw_data) if isinstance(raw_data, dict) else (raw_data if isinstance(raw_data, list) else [raw_data])
 
-        dict_muestras = {}
+        # 1. OPTIMIZACIÓN: Pre-calcular los nombres de las columnas una sola vez
+        if not items:
+            return jsonify({"status": "success", "resultados_estadisticos": [], "muestras_rechazadas": []}), 200
+            
+        primera_fila = items[0].keys()
+        col_t = next((k for k in primera_fila if any(x in str(k).upper() for x in ["TRAZA", "SLA", "TIEMPO"])), None)
+        col_b = next((k for k in primera_fila if "ASIGNADO" in str(k).upper()), None)
+        col_c = next((k for k in primera_fila if "CASUISTICA" in str(k).upper() or "CASO" in str(k).upper()), None)
+        col_d = next((k for k in primera_fila if "OPS" in str(k).upper() or "OPERACION" in str(k).upper()), None)
+
+        if not col_t:
+            return jsonify({"error": "No se encontro columna de tiempo"}), 400
+
+        # Usamos listas normales en Python (mucho más rápido que np.append en un bucle)
+        dict_muestras_temp = {}
+
         for fila in items:
-            # --- BUSCADOR INTELIGENTE DE COLUMNAS ---
-            t_raw = next((v for k, v in fila.items() if any(x in str(k).upper() for x in ["TRAZA", "SLA", "TIEMPO"])), None)
-            col_b = next((v for k, v in fila.items() if "ASIGNADO" in str(k).upper()), "Sin Asignado")
-            col_c = next((v for k, v in fila.items() if "CASUISTICA" in str(k).upper() or "CASO" in str(k).upper()), "Sin Caso")
-            col_d = next((v for k, v in fila.items() if "OPS" in str(k).upper() or "OPERACION" in str(k).upper()), "N/A")
+            # Extracción directa (O(1) en vez de O(N))
+            t_raw = fila.get(col_t)
+            v_b = fila.get(col_b, "Sin Asignado") if col_b else "Sin Asignado"
+            v_c = fila.get(col_c, "Sin Caso") if col_c else "Sin Caso"
+            v_d = fila.get(col_d, "N/A") if col_d else "N/A"
             
-            key = f"{col_b} | {col_c} | {col_d}"
-            
-            if t_raw is None: 
-                continue
+            key = f"{v_b} | {v_c} | {v_d}"
+            if t_raw is None: continue
 
-            # --- PROCESAMIENTO Y LIMPIEZA DEL DATO ---
             procesados = []
             try:
                 if isinstance(t_raw, list):
@@ -153,32 +165,31 @@ def analizar():
                 elif isinstance(t_raw, str):
                     t_raw_str = t_raw.strip()
                     if t_raw_str.startswith('['):
-                        lista_eval = ast.literal_eval(t_raw_str)
+                        # 2. OPTIMIZACIÓN: Usar json.loads es mucho más rápido que ast.literal_eval
+                        lista_eval = json.loads(t_raw_str.replace("'", '"')) 
                         procesados = [convertir_a_minutos(t) for t in lista_eval if t]
                     else:
                         procesados = [convertir_a_minutos(t_raw_str)]
                 else:
                     procesados = [convertir_a_minutos(t_raw)]
                 
-                # --- AGREGAR A LA MUESTRA SIN DUPLICAR EXPONENCIALMENTE ---
+                # 3. OPTIMIZACIÓN: Usar .append de Python y convertir a Numpy al final
                 if procesados:
-                    if key in dict_muestras:
-                        dict_muestras[key] = np.append(dict_muestras[key], procesados)
-                    else:
-                        dict_muestras[key] = np.array(procesados)
-            except Exception as e:
-                # Ignoramos silenciosamente errores de parseo de filas individuales 
-                # para que no tumbe el endpoint completo
+                    if key not in dict_muestras_temp:
+                        dict_muestras_temp[key] = []
+                    dict_muestras_temp[key].extend(procesados)
+            except Exception:
                 pass
+
+        # Convertir a Numpy arrays todo al final de una sola vez
+        dict_muestras = {k: np.array(v) for k, v in dict_muestras_temp.items()}
 
         validas, rechazadas = {}, []
         for nombre, datos in dict_muestras.items():
-            # Prueba 1: Cantidad
             if len(datos) < 4:
                 rechazadas.append({"nombre": nombre, "motivo": f"Datos insuficientes ({len(datos)})"})
                 continue
             
-            # Prueba 2: Aleatoriedad
             if pasa_aleatoriedad(datos):
                 validas[nombre] = datos
             else:
@@ -190,9 +201,7 @@ def analizar():
 
         res_estadisticos = []
         if validas:
-            # Prueba 3: Homogeneidad (Pooling)
             pooled = agrupar_muestras_homogeneas(validas) if len(validas) > 1 else {list(validas.keys())[0]: list(validas.values())[0]}
-            # Prueba 4: Bondad de Ajuste
             for n, d in pooled.items():
                 res_estadisticos.append(ajustar_grupo(d, n))
 
@@ -209,5 +218,4 @@ def analizar():
 def health(): return jsonify({"status": "online"}), 200
 
 if __name__ == '__main__':
-    # Render usa la variable de entorno PORT
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
