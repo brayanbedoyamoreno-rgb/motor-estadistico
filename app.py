@@ -135,25 +135,41 @@ def analizar():
         dict_muestras = {}
         for fila in items:
             # --- BUSCADOR INTELIGENTE DE COLUMNAS ---
-            t_raw = next((v for k, v in fila.items() if any(x in str(k).upper() for x in ["TRAZA", "SLA", "TIEMPO"])), "")
+            t_raw = next((v for k, v in fila.items() if any(x in str(k).upper() for x in ["TRAZA", "SLA", "TIEMPO"])), None)
             col_b = next((v for k, v in fila.items() if "ASIGNADO" in str(k).upper()), "Sin Asignado")
             col_c = next((v for k, v in fila.items() if "CASUISTICA" in str(k).upper() or "CASO" in str(k).upper()), "Sin Caso")
             col_d = next((v for k, v in fila.items() if "OPS" in str(k).upper() or "OPERACION" in str(k).upper()), "N/A")
             
             key = f"{col_b} | {col_c} | {col_d}"
             
+            if t_raw is None: 
+                continue
+
+            # --- PROCESAMIENTO Y LIMPIEZA DEL DATO ---
+            procesados = []
             try:
-                if isinstance(t_raw, list): lista = t_raw
-                elif isinstance(t_raw, str) and t_raw.strip().startswith('['): lista = ast.literal_eval(t_raw)
-                else: lista = [t_raw]
-                
-                minutos = [convertir_a_minutos(t) for t in lista if t]
-                if minutos:
-                    if key in dict_muestras:
-                        dict_muestras[key] = np.concatenate([dict_muestras[key], minutos])
+                if isinstance(t_raw, list):
+                    procesados = [convertir_a_minutos(t) for t in t_raw if t]
+                elif isinstance(t_raw, str):
+                    t_raw_str = t_raw.strip()
+                    if t_raw_str.startswith('['):
+                        lista_eval = ast.literal_eval(t_raw_str)
+                        procesados = [convertir_a_minutos(t) for t in lista_eval if t]
                     else:
-                        dict_muestras[key] = np.array(minutos)
-            except: pass
+                        procesados = [convertir_a_minutos(t_raw_str)]
+                else:
+                    procesados = [convertir_a_minutos(t_raw)]
+                
+                # --- AGREGAR A LA MUESTRA SIN DUPLICAR EXPONENCIALMENTE ---
+                if procesados:
+                    if key in dict_muestras:
+                        dict_muestras[key] = np.append(dict_muestras[key], procesados)
+                    else:
+                        dict_muestras[key] = np.array(procesados)
+            except Exception as e:
+                # Ignoramos silenciosamente errores de parseo de filas individuales 
+                # para que no tumbe el endpoint completo
+                pass
 
         validas, rechazadas = {}, []
         for nombre, datos in dict_muestras.items():
